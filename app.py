@@ -15,7 +15,17 @@ from fastapi.responses import JSONResponse
 import uvicorn
 import traceback
 from dotenv import load_dotenv
-from embedding import semantic_search
+
+# Try to import embedding module, but don't fail if it's not available
+try:
+    from embedding import semantic_search
+except ImportError:
+    # Create a dummy function if embedding module is not available
+    def semantic_search(query: str, top_k: int = 3) -> dict:
+        return {
+            "answer": "Embedding functionality not available in this deployment.",
+            "links": []
+        }
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,9 +36,9 @@ DB_PATH = "knowledge_base.db"
 SIMILARITY_THRESHOLD = 0.68  # Lowered threshold for better recall
 MAX_RESULTS = 10  # Increased to get more context
 load_dotenv()
-print("DEBUG: API_KEY from os.environ =", os.getenv("API_KEY"))
+print("DEBUG: AIPROXY_TOKEN from os.environ =", os.getenv("AIPROXY_TOKEN"))
 MAX_CONTEXT_CHUNKS = 4  # Increased number of chunks per source
-API_KEY = os.getenv("API_KEY")  # Get API key from environment variable
+API_KEY = os.getenv("AIPROXY_TOKEN")  # Get API key from environment variable
 
 # Models
 class QueryRequest(BaseModel):
@@ -57,7 +67,7 @@ app.add_middleware(
 
 # Verify API key is set
 if not API_KEY:
-    logger.error("API_KEY environment variable is not set. The application will not function correctly.")
+    logger.error("AIPROXY_TOKEN environment variable is not set. The application will not function correctly.")
 
 # Create a connection to the SQLite database
 def get_db_connection():
@@ -135,10 +145,10 @@ def cosine_similarity(vec1, vec2):
         logger.error(traceback.format_exc())
         return 0.0  # Return 0 similarity on error rather than crashing
 
-# Function to get embedding from Hugging Face's Inference API
+# Function to get embedding from AIproxy
 async def get_embedding(text, max_retries=3):
     if not API_KEY:
-        error_msg = "API_KEY environment variable not set"
+        error_msg = "AIPROXY_TOKEN environment variable not set"
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
     
@@ -146,23 +156,24 @@ async def get_embedding(text, max_retries=3):
     while retries < max_retries:
         try:
             logger.info(f"Getting embedding for text (length: {len(text)})")
-            # Call Hugging Face's Inference API
-            url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+            # Call AIproxy API
+            url = "https://aiproxy.sanand.workers.dev/openai/v1/embeddings"
             headers = {
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {API_KEY}"
             }
             payload = {
-                "inputs": [text]
+                "model": "text-embedding-3-small",
+                "input": text
             }
             
-            logger.info("Sending request to Hugging Face Inference API")
+            logger.info("Sending request to AIproxy API")
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=payload) as response:
                     if response.status == 200:
                         result = await response.json()
                         logger.info("Successfully received embedding")
-                        return result[0]  # Return the first embedding
+                        return result["data"][0]["embedding"]  # Return the embedding vector
                     elif response.status == 429:  # Rate limit error
                         error_text = await response.text()
                         logger.warning(f"Rate limit reached, retrying after delay (retry {retries+1}): {error_text}")
@@ -390,7 +401,7 @@ async def enrich_with_adjacent_chunks(conn, results):
 # Function to generate an answer using LLM with improved prompt
 async def generate_answer(question, relevant_results, max_retries=2):
     if not API_KEY:
-        error_msg = "API_KEY environment variable not set"
+        error_msg = "AIPROXY_TOKEN environment variable not set"
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
     
@@ -468,7 +479,7 @@ async def generate_answer(question, relevant_results, max_retries=2):
 # Function to process multimodal content (text + image)
 async def process_multimodal_query(question, image_base64):
     if not API_KEY:
-        error_msg = "API_KEY environment variable not set"
+        error_msg = "AIPROXY_TOKEN environment variable not set"
         logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
         
@@ -612,14 +623,52 @@ def get_relevant_links(question: str) -> List[LinkInfo]:
 @app.post("/query")
 async def query_knowledge_base(request: QueryRequest):
     try:
-        # Get relevant links based on the question
-        relevant_links = get_relevant_links(request.question)
+        logger.info(f"Processing query: '{request.question[:50]}...'")
         
-        # Your existing logic to generate the answer
-        # For example, using semantic search or other methods
-        answer = "Your answer logic here"  # Replace with your actual answer generation logic
+        # Get database connection
+        conn = get_db_connection()
         
-        return QueryResponse(answer=answer, links=relevant_links)
+        try:
+            # Handle multimodal queries (with image)
+            if request.image:
+                logger.info("Processing multimodal query with image")
+                query_embedding = await process_multimodal_query(request.question, request.image)
+            else:
+                logger.info("Processing text-only query")
+                # Get embedding for the question
+                query_embedding = await get_embedding(request.question)
+            
+            # Find similar content in the database
+            relevant_results = await find_similar_content(query_embedding, conn)
+            
+            # Enrich with adjacent chunks for better context
+            enriched_results = await enrich_with_adjacent_chunks(conn, relevant_results)
+            
+            if enriched_results:
+                logger.info(f"Found {len(enriched_results)} relevant results")
+                # Generate answer using LLM
+                llm_response = await generate_answer(request.question, enriched_results)
+                
+                # Parse the response to extract answer and sources
+                parsed_response = parse_llm_response(llm_response)
+                answer = parsed_response["answer"]
+                links = [LinkInfo(url=link["url"], text=link["text"]) for link in parsed_response["links"]]
+            else:
+                logger.info("No relevant results found, using fallback response")
+                # Fallback response when no relevant content is found
+                answer = "I don't have enough information to answer this question based on the available knowledge base. Please check the course documentation or ask on the course forum for more specific information."
+                links = []
+            
+            # Add any additional relevant links based on question keywords
+            additional_links = get_relevant_links(request.question)
+            links.extend(additional_links)
+            
+            logger.info(f"Generated answer (length: {len(answer)}) with {len(links)} links")
+            return QueryResponse(answer=answer, links=links)
+            
+        finally:
+            conn.close()
+            
     except Exception as e:
         logger.error(f"Error processing query: {e}")
         logger.error(traceback.format_exc())
@@ -652,7 +701,7 @@ async def health_check():
         return {
             "status": "healthy", 
             "database": "connected", 
-            "api_key_set": bool(API_KEY),
+            "aiproxy_token_set": bool(API_KEY),
             "discourse_chunks": discourse_count,
             "markdown_chunks": markdown_count,
             "discourse_embeddings": discourse_embeddings,
@@ -662,8 +711,17 @@ async def health_check():
         logger.error(f"Health check failed: {e}")
         return JSONResponse(
             status_code=500,
-            content={"status": "unhealthy", "error": str(e), "api_key_set": bool(API_KEY)}
+            content={"status": "unhealthy", "error": str(e), "aiproxy_token_set": bool(API_KEY)}
         )
+
+# Simple test endpoint
+@app.get("/")
+async def root():
+    return {"message": "TDS Virtual TA API is running!", "status": "success"}
+
+@app.get("/test")
+async def test():
+    return {"message": "Test endpoint working!", "timestamp": "2025-06-18"}
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True) 
